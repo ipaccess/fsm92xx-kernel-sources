@@ -1,4 +1,4 @@
-/* Copyright (c) 2011, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2011, 2014 The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -29,11 +29,6 @@
  * Time QFPROM requires to reliably burn a fuse.
  */
 #define QFPROM_BLOW_TIMEOUT_US      10
-#define QFPROM_BLOW_TIMER_OFFSET    0x2038
-/*
- * Denotes number of cycles required to blow the fuse.
- */
-#define QFPROM_BLOW_TIMER_VALUE     (QFPROM_BLOW_TIMEOUT_US * 83)
 
 #define QFPROM_BLOW_STATUS_OFFSET   0x204C
 #define QFPROM_BLOW_STATUS_BUSY     0x01
@@ -41,6 +36,10 @@
 
 #define QFP_FUSE_READY              0x01
 #define QFP_FUSE_OFF                0x00
+
+#define QFP_FUSE_BUF_SIZE           64
+#define UINT32_MAX                  (0xFFFFFFFFU)
+
 
 struct qfp_priv_t {
 	uint32_t base;
@@ -53,6 +52,23 @@ struct qfp_priv_t {
 /* We need only one instance of this for the driver */
 static struct qfp_priv_t *qfp_priv;
 
+static inline bool is_usr_req_valid(const struct qfp_fuse_req *req)
+{
+	uint32_t size = qfp_priv->end - qfp_priv->base;
+	uint32_t req_size;
+
+	if (req->size >= (UINT32_MAX / sizeof(uint32_t)))
+		return false;
+	req_size = req->size * sizeof(uint32_t);
+	if ((req_size == 0) || (req_size > size))
+		return false;
+	if (req->offset >= size)
+		return false;
+	if ((req->offset + req_size) > size)
+		return false;
+
+	return true;
+}
 
 static int qfp_fuse_open(struct inode *inode, struct file *filp)
 {
@@ -115,9 +131,6 @@ static int qfp_fuse_write_word(u32 *addr, u32 data)
 	u32 read_data;
 	int err;
 
-	/* Set QFPROM  blow timer register */
-	writel_relaxed(QFPROM_BLOW_TIMER_VALUE,
-			qfp_priv->base + QFPROM_BLOW_TIMER_OFFSET);
 	mb();
 
 	/* Enable LVS0 regulator */
@@ -177,7 +190,9 @@ qfp_fuse_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	int err = 0;
 	struct qfp_fuse_req req;
-	u32 *buf = NULL;
+	u32 fuse_buf[QFP_FUSE_BUF_SIZE];
+	u32 *buf = fuse_buf;
+	u32 *ptr = NULL;
 	int i;
 
 	/* Verify user arguments. */
@@ -199,25 +214,21 @@ qfp_fuse_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		}
 
 		/* Check for limits */
-		if (!req.size) {
-			pr_err("Request size zero.\n");
-			err = -EFAULT;
+		if (is_usr_req_valid(&req) == false) {
+			pr_err("Invalid request\n");
+			err = -EINVAL;
 			break;
 		}
 
-		if (qfp_priv->base + req.offset + (req.size - 1) * 4 >
-				qfp_priv->end) {
-			pr_err("Req size exceeds QFPROM addr space\n");
-			err = -EFAULT;
-			break;
-		}
-
-		/* Allocate memory for buffer */
-		buf = kzalloc(req.size * 4, GFP_KERNEL);
-		if (buf == NULL) {
-			pr_alert("No memory for data\n");
-			err = -ENOMEM;
-			break;
+		if (req.size > QFP_FUSE_BUF_SIZE) {
+			/* Allocate memory for buffer */
+			ptr = kzalloc(req.size * 4, GFP_KERNEL);
+			if (ptr == NULL) {
+				pr_alert("No memory for data\n");
+				err = -ENOMEM;
+				break;
+			}
+			buf = ptr;
 		}
 
 		if (mutex_lock_interruptible(&qfp_priv->lock)) {
@@ -251,24 +262,21 @@ qfp_fuse_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			break;
 		}
 		/* Check for limits */
-		if (!req.size) {
-			pr_err("Request size zero.\n");
-			err = -EFAULT;
-			break;
-		}
-		if (qfp_priv->base + req.offset + (req.size - 1) * 4 >
-				qfp_priv->end) {
-			pr_err("Req size exceeds QFPROM space\n");
-			err = -EFAULT;
+		if (is_usr_req_valid(&req) == false) {
+			pr_err("Invalid request\n");
+			err = -EINVAL;
 			break;
 		}
 
-		/* Allocate memory for buffer */
-		buf = kzalloc(4 * (req.size), GFP_KERNEL);
-		if (buf == NULL) {
-			pr_alert("No memory for data\n");
-			err = -ENOMEM;
-			break;
+		if (req.size > QFP_FUSE_BUF_SIZE) {
+			/* Allocate memory for buffer */
+			ptr = kzalloc(req.size * 4, GFP_KERNEL);
+			if (ptr == NULL) {
+				pr_alert("No memory for data\n");
+				err = -ENOMEM;
+				break;
+			}
+			buf = ptr;
 		}
 
 		/* Copy user data to local buffer */
@@ -296,7 +304,7 @@ qfp_fuse_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		pr_err("Invalid ioctl command.\n");
 		return -ENOTTY;
 	}
-	kfree(buf);
+	kfree(ptr);
 	return err;
 }
 
